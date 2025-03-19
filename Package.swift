@@ -11,13 +11,15 @@ let package = Package(
     products: [
         .executable(name: "ParetoOptimization", targets: ["ParetoOptimization"])
     ],
-    dependencies: [
-        // No external dependencies needed as we're using Apple frameworks
-    ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "ParetoOptimization",
-            dependencies: ["OptimizationCore", "GeneticAlgorithm", "MetalAcceleration"]
+            dependencies: [
+                "OptimizationCore", 
+                "GeneticAlgorithm", 
+                "MetalAcceleration"
+            ]
         ),
         .target(
             name: "OptimizationCore",
@@ -29,7 +31,14 @@ let package = Package(
         ),
         .target(
             name: "MetalAcceleration",
-            dependencies: ["OptimizationCore"]
+            dependencies: ["OptimizationCore"],
+            exclude: ["dominance.metal"],  // Exclude the Metal shader file
+            resources: [
+                .process("Shaders")  // Add this if you have a Shaders directory
+            ],
+            swiftSettings: [
+                .unsafeFlags(["-F/System/Library/Frameworks"]) // This ensures proper Foundation and Objective-C runtime access
+            ]
         )
     ]
 )

@@ -1,69 +1,209 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Intensive computation for each objective
-float3 compute_objectives(const device float* values) {
-    float x = values[0];
-    float y = values[1];
-    
-    // Objective 1: Complex sinusoidal pattern
-    float obj1 = sin(x * 3.14159) * cos(y * 2.71828) * exp(-((x*x + y*y)/100.0));
-    
-    // Objective 2: Waves and peaks
-    float obj2 = cos(sqrt(x*x + y*y)) * exp(-(x*x + y*y)/200.0) + sin(x*0.5) * cos(y*0.5);
-    
-    // Objective 3: Complex landscape
-    float obj3 = sin(x*y/10.0) * cos(x-y) * exp(-(x*x + y*y)/300.0);
-    
-    // Do intensive computation to stress the GPU
-    for(int i = 0; i < 100; i++) {
-        obj1 = sin(obj1) * cos(obj2) + obj3;
-        obj2 = cos(obj2) * sin(obj3) + obj1;
-        obj3 = sin(obj3) * cos(obj1) + obj2;
+/* 
+ This file contains Metal shader functions for flowshop scheduling evaluation
+ and Pareto dominance checking. It's optimized for Apple Silicon's unified memory
+ architecture to minimize data transfers.
+*/
+
+// Maximum number of jobs and machines we'll support
+constant int MAX_JOBS = 200;
+constant int MAX_MACHINES = 10;
+
+/// Evaluate a single flowshop solution on GPU
+kernel void evaluate_flowshop(
+    device const uint* jobSequence [[buffer(0)]],            // Input job sequence
+    device const float* processingTimes [[buffer(1)]],       // Processing times matrix (flattened)
+    device const float* priorities [[buffer(2)]],            // Job priorities
+    device const float* deadlines [[buffer(3)]],             // Job deadlines
+    device float2* objectives [[buffer(4)]],                 // Output objectives (makespan, tardiness)
+    device const uint& numJobs [[buffer(5)]],                // Number of jobs
+    device const uint& numMachines [[buffer(6)]],            // Number of machines
+    device const uint& numSolutions [[buffer(7)]],           // Number of solutions to evaluate
+    uint solutionIndex [[thread_position_in_grid]]           // Solution being evaluated by this thread
+) {
+    // Check that we don't exceed array bounds
+    if (solutionIndex >= numSolutions) {
+        return;
+    }
+
+    // Calculate completion times of each job on each machine
+    float completionTimes[MAX_MACHINES];
+    for (uint m = 0; m < numMachines; m++) {
+        completionTimes[m] = 0.0f;  // Initialize to zero
     }
     
-    return float3(obj1, obj2, obj3);
+    float totalWeightedTardiness = 0.0f;
+    
+    // Process each job in the sequence
+    for (uint j = 0; j < numJobs; j++) {
+        // Get the job ID from the sequence
+        uint jobId = jobSequence[solutionIndex * numJobs + j];
+        
+        // Ensure job ID is in bounds
+        if (jobId >= numJobs) {
+            continue;  // Skip this job if ID is invalid
+        }
+        
+        // Calculate completion time on first machine
+        completionTimes[0] += processingTimes[jobId * numMachines + 0];
+        
+        // Calculate completion times on subsequent machines
+        for (uint m = 1; m < numMachines; m++) {
+            // Each job must wait for previous machine to complete
+            completionTimes[m] = max(completionTimes[m], completionTimes[m-1]);
+            
+            // Add processing time on current machine
+            completionTimes[m] += processingTimes[jobId * numMachines + m];
+        }
+        
+        // Calculate tardiness contribution of this job
+        float jobCompletionTime = completionTimes[numMachines - 1];
+        float jobDeadline = deadlines[jobId];
+        float jobTardiness = max(0.0f, jobCompletionTime - jobDeadline);
+        float jobPriority = priorities[jobId];
+        
+        // Add weighted tardiness to total
+        totalWeightedTardiness += jobTardiness * jobPriority;
+    }
+    
+    // Store makespan (completion time of last job on last machine)
+    float makespan = completionTimes[numMachines - 1];
+    
+    // Save objectives
+    objectives[solutionIndex] = float2(makespan, totalWeightedTardiness);
 }
 
-kernel void dominance_check(const device float* solutions [[buffer(0)]],
-                          device int* dominance_matrix [[buffer(1)]],
-                          uint2 position [[thread_position_in_grid]],
-                          uint2 grid_size [[threads_per_grid]]) {
+/// Generate a random permutation using PCG random number generator
+static void generate_permutation(
+    thread uint* sequence,
+    uint length,
+    uint seed,
+    uint sequence_idx
+) {
+    // Initialize PCG state
+    uint state = seed + sequence_idx * 1013904223;
     
-    const int i = position.x;
-    const int j = position.y;
+    // Fisher-Yates shuffle
+    for (uint i = 0; i < length; i++) {
+        sequence[i] = i;
+    }
     
-    if (i >= grid_size.x || j >= grid_size.y || i == j) {
+    for (uint i = length - 1; i > 0; i--) {
+        // PCG random number generation
+        state = state * 747796405 + 2891336453;
+        uint word = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+        uint next = (word >> 22) ^ word;
+        
+        // Random index between 0 and i
+        uint j = next % (i + 1);
+        
+        // Swap elements i and j
+        uint temp = sequence[i];
+        sequence[i] = sequence[j];
+        sequence[j] = temp;
+    }
+}
+
+/// Generate and evaluate random solutions on GPU
+kernel void generate_and_evaluate_flowshop(
+    device uint* outputSequences [[buffer(0)]],              // Output job sequences
+    device const float* processingTimes [[buffer(1)]],       // Processing times matrix (flattened)
+    device const float* priorities [[buffer(2)]],            // Job priorities
+    device const float* deadlines [[buffer(3)]],             // Job deadlines
+    device float2* objectives [[buffer(4)]],                 // Output objectives (makespan, tardiness)
+    device const uint& numJobs [[buffer(5)]],                // Number of jobs
+    device const uint& numMachines [[buffer(6)]],            // Number of machines
+    device const uint& numSolutions [[buffer(7)]],           // Number of solutions to generate
+    device const uint& seed [[buffer(8)]],                   // Random seed
+    uint solutionIndex [[thread_position_in_grid]]           // Solution being generated by this thread
+) {
+    // Check that we don't exceed array bounds
+    if (solutionIndex >= numSolutions) {
         return;
     }
     
-    // Each solution has 10 values
-    const device float* sol_i = solutions + (i * 10);
-    const device float* sol_j = solutions + (j * 10);
+    // Local array for the job sequence
+    uint jobSequence[MAX_JOBS];
     
-    // Compute objectives for both solutions
-    float3 objectives_i = compute_objectives(sol_i);
-    float3 objectives_j = compute_objectives(sol_j);
+    // Generate a random permutation
+    generate_permutation(jobSequence, numJobs, seed, solutionIndex);
     
-    // Check dominance
-    bool i_dominates_j = true;
-    bool j_dominates_i = true;
-    
-    for (int k = 0; k < 3; k++) {
-        if (objectives_i[k] > objectives_j[k]) {
-            i_dominates_j = false;
-        }
-        if (objectives_j[k] > objectives_i[k]) {
-            j_dominates_i = false;
-        }
+    // Store the permutation in global memory
+    for (uint j = 0; j < numJobs; j++) {
+        outputSequences[solutionIndex * numJobs + j] = jobSequence[j];
     }
     
-    // Store result in dominance matrix
-    if (i_dominates_j && !j_dominates_i) {
-        dominance_matrix[i * grid_size.x + j] = 1;
-    } else if (j_dominates_i && !i_dominates_j) {
-        dominance_matrix[i * grid_size.x + j] = -1;
-    } else {
-        dominance_matrix[i * grid_size.x + j] = 0;
+    // Calculate completion times of each job on each machine
+    float completionTimes[MAX_MACHINES];
+    for (uint m = 0; m < numMachines; m++) {
+        completionTimes[m] = 0.0f;  // Initialize to zero
+    }
+    
+    float totalWeightedTardiness = 0.0f;
+    
+    // Process each job in the sequence
+    for (uint j = 0; j < numJobs; j++) {
+        // Get the job ID from the sequence
+        uint jobId = jobSequence[j];
+        
+        // Calculate completion time on first machine
+        completionTimes[0] += processingTimes[jobId * numMachines + 0];
+        
+        // Calculate completion times on subsequent machines
+        for (uint m = 1; m < numMachines; m++) {
+            // Each job must wait for previous machine to complete
+            completionTimes[m] = max(completionTimes[m], completionTimes[m-1]);
+            
+            // Add processing time on current machine
+            completionTimes[m] += processingTimes[jobId * numMachines + m];
+        }
+        
+        // Calculate tardiness contribution of this job
+        float jobCompletionTime = completionTimes[numMachines - 1];
+        float jobDeadline = deadlines[jobId];
+        float jobTardiness = max(0.0f, jobCompletionTime - jobDeadline);
+        float jobPriority = priorities[jobId];
+        
+        // Add weighted tardiness to total
+        totalWeightedTardiness += jobTardiness * jobPriority;
+    }
+    
+    // Store makespan (completion time of last job on last machine)
+    float makespan = completionTimes[numMachines - 1];
+    
+    // Save objectives
+    objectives[solutionIndex] = float2(makespan, totalWeightedTardiness);
+}
+
+/// Check if one solution dominates another with bi-objective optimization
+kernel void check_dominance(
+    device const float2* objectives [[buffer(0)]],         // Array of objective values (makespan, tardiness)
+    device atomic_int* dominanceMatrix [[buffer(1)]],      // Output dominance matrix (1 if row dominates column)
+    device const uint& numSolutions [[buffer(2)]],         // Number of solutions
+    uint2 position [[thread_position_in_grid]]             // Position in the dominance matrix
+) {
+    // Get indices for the two solutions to compare
+    uint i = position.x;
+    uint j = position.y;
+    
+    // Skip diagonal elements (same solution) and out-of-bounds
+    if (i >= numSolutions || j >= numSolutions || i == j) {
+        return;
+    }
+    
+    // Get the objectives for both solutions
+    float2 obj_i = objectives[i];
+    float2 obj_j = objectives[j];
+    
+    // For minimization: solution i dominates solution j if it's at least as good
+    // in all objectives and strictly better in at least one
+    bool atLeastAsGoodInAll = (obj_i.x <= obj_j.x) && (obj_i.y <= obj_j.y);
+    bool strictlyBetterInOne = (obj_i.x < obj_j.x) || (obj_i.y < obj_j.y);
+    
+    // If dominates, mark in the matrix
+    if (atLeastAsGoodInAll && strictlyBetterInOne) {
+        atomic_store_explicit(dominanceMatrix + (i * numSolutions + j), 1, memory_order_relaxed);
     }
 }
