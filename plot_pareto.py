@@ -2,6 +2,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 import csv
+import time
+from datetime import datetime
+import os
 
 def evaluate_sequence(sequence, processing_times, priorities, deadlines):
     """Evaluate a job sequence to get makespan and total weighted tardiness."""
@@ -59,12 +62,14 @@ def load_instance(file_path):
 def plot_pareto_front(solutions_file, instance_file, output_file=None):
     """Plot the Pareto front from the solutions file."""
     # Load problem instance
+    print(f"Loading problem instance from {instance_file}")
     processing_times, priorities, deadlines = load_instance(instance_file)
     
     # Load and evaluate solutions
     makespans = []
     tardiness = []
     
+    print(f"Evaluating solutions from {solutions_file}")
     with open(solutions_file, 'r') as f:
         reader = csv.reader(f)
         for row in reader:
@@ -73,15 +78,28 @@ def plot_pareto_front(solutions_file, instance_file, output_file=None):
             makespans.append(makespan)
             tardiness.append(tard)
     
-    # Create the plot
-    plt.figure(figsize=(10, 6))
-    plt.scatter(makespans, tardiness, c='blue', alpha=0.6)
-    plt.plot(makespans, tardiness, 'b--', alpha=0.3)  # Connect points to show front
+    # Create the plot with a timestamp for uniqueness
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    plt.figure(figsize=(12, 8))
     
-    # Labels and title
-    plt.xlabel('Makespan')
-    plt.ylabel('Total Weighted Tardiness')
-    plt.title('Pareto Front for Flowshop Problem')
+    # Scatter plot with larger points and more opacity
+    plt.scatter(makespans, tardiness, c='blue', s=100, alpha=0.8, label='Solutions')
+    
+    # Connect points with lines to show front
+    # Sort points by makespan for correct line drawing
+    sorted_indices = np.argsort(makespans)
+    sorted_makespans = [makespans[i] for i in sorted_indices]
+    sorted_tardiness = [tardiness[i] for i in sorted_indices]
+    plt.plot(sorted_makespans, sorted_tardiness, 'b--', alpha=0.5, linewidth=2)
+    
+    # Add point numbers for easier reference
+    for i, (x, y) in enumerate(zip(makespans, tardiness)):
+        plt.annotate(f"{i+1}", (x, y), xytext=(5, 5), textcoords='offset points', fontsize=9)
+    
+    # Labels and title with timestamp
+    plt.xlabel('Makespan', fontsize=14)
+    plt.ylabel('Total Weighted Tardiness', fontsize=14)
+    plt.title(f'Pareto Front for Flowshop Problem\nGenerated: {timestamp}', fontsize=16)
     
     # Grid
     plt.grid(True, linestyle='--', alpha=0.7)
@@ -91,23 +109,47 @@ def plot_pareto_front(solutions_file, instance_file, output_file=None):
     stats_text += f'Makespan range: [{min(makespans):.1f}, {max(makespans):.1f}]\n'
     stats_text += f'Tardiness range: [{min(tardiness):.1f}, {max(tardiness):.1f}]'
     plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
-             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+             verticalalignment='top', fontsize=12, 
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
     
-    # Save or show
+    # Better style
+    plt.tight_layout()
+    
+    # Force axes to refresh (avoids caching issues)
+    plt.gcf().canvas.draw()
+    
+    # Generate timestamp-based filenames
+    timestamp_file = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Determine output paths
     if output_file:
-        plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"Plot saved to {output_file}")
+        output_path = output_file
     else:
-        plt.show()
+        script_dir = Path(__file__).parent
+        output_path = script_dir / "pareto_front.png"
+    
+    # Always create a timestamped version
+    timestamped_path = output_path.parent / f"pareto_front_{timestamp_file}.png"
+    
+    # Save both the standard and timestamped versions
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(timestamped_path, dpi=300, bbox_inches='tight')
+    
+    print(f"Plot saved to: \n  {output_path} \n  {timestamped_path}")
+    
+    # Open the image file automatically (works on macOS)
+    try:
+        os.system(f"open {timestamped_path}")
+    except:
+        print(f"Could not automatically open the image. Please find it at: {timestamped_path}")
 
 if __name__ == "__main__":
     # Get the directory containing this script
     script_dir = Path(__file__).parent
     
     # Define paths relative to script location
-    solutions_file = script_dir / "15.csv"
+    solutions_file = script_dir / "birch_delacalle_nicholas.csv"
     instance_file = script_dir / "instance.csv"
-    output_file = script_dir / "pareto_front.png"
     
-    # Create the plot
-    plot_pareto_front(solutions_file, instance_file, output_file)
+    # Create the plot with auto-generated filename
+    plot_pareto_front(solutions_file, instance_file)

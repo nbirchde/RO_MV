@@ -276,20 +276,8 @@ public class FlowshopGPUGeneticAlgorithm {
             var diverseOffspring: [FlowshopChromosome] = []
             let selectionCount = populationSize - elites.count
             
-            // Add solutions from sorted list at regular intervals to maximize diversity
-            let step = max(1, sortedOffspring.count / selectionCount)
-            for i in stride(from: 0, to: min(sortedOffspring.count, step * selectionCount), by: step) {
-                diverseOffspring.append(sortedOffspring[i])
-            }
-            
-            // Fill any remaining slots
-            while diverseOffspring.count < selectionCount && !sortedOffspring.isEmpty {
-                if let randomSolution = sortedOffspring.randomElement() {
-                    if !diverseOffspring.contains(where: { $0 == randomSolution }) {
-                        diverseOffspring.append(randomSolution)
-                    }
-                }
-            }
+            // Use our grid-based diversity selection for better coverage of the solution space
+            diverseOffspring = selectDiverseSubset(from: sortedOffspring, count: selectionCount)
             
             // Add diverse offspring to the new population
             newPopulation.append(contentsOf: diverseOffspring)
@@ -492,8 +480,10 @@ public class FlowshopGPUGeneticAlgorithm {
                 let tardiness = (sol.criteria[1] as! NumericCriterion).value
                 
                 // Calculate grid cell
-                let i = min(gridSize-1, Int((makespan - makespanMin) / makespanRange * Double(gridSize)))
-                let j = min(gridSize-1, Int((tardiness - tardinessMin) / tardinessRange * Double(gridSize)))
+                let i = min(gridSize-1, makespanRange > 0.001 ? 
+                    Int((makespan - makespanMin) / makespanRange * Double(gridSize)) : 0)
+                let j = min(gridSize-1, tardinessRange > 0.001 ? 
+                    Int((tardiness - tardinessMin) / tardinessRange * Double(gridSize)) : 0)
                 
                 grid[i][j] = true
             }
@@ -506,8 +496,10 @@ public class FlowshopGPUGeneticAlgorithm {
                 let tardiness = (sol.criteria[1] as! NumericCriterion).value
                 
                 // Calculate grid cell
-                let i = min(gridSize-1, Int((makespan - makespanMin) / makespanRange * Double(gridSize)))
-                let j = min(gridSize-1, Int((tardiness - tardinessMin) / tardinessRange * Double(gridSize)))
+                let i = min(gridSize-1, makespanRange > 0.001 ? 
+                    Int((makespan - makespanMin) / makespanRange * Double(gridSize)) : 0)
+                let j = min(gridSize-1, tardinessRange > 0.001 ? 
+                    Int((tardiness - tardinessMin) / tardinessRange * Double(gridSize)) : 0)
                 
                 if !grid[i][j] && !selected.contains(sol) {
                     selected.append(sol)

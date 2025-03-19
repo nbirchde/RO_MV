@@ -26,6 +26,9 @@ public class FlowshopMetalAccelerator {
     private var prioritiesBuffer: MTLBuffer?
     private var deadlinesBuffer: MTLBuffer?
     
+    private var sequencesBufferPool: [MTLBuffer] = []
+    private var objectivesBufferPool: [MTLBuffer] = []
+
     // Initialize Metal setup
     private init() {
         print("Initializing Metal Accelerator...")
@@ -284,6 +287,27 @@ public class FlowshopMetalAccelerator {
         }
     }
     
+    private func getBufferFromPool(pool: inout [MTLBuffer], size: Int, options: MTLResourceOptions) -> MTLBuffer? {
+        // Look for a buffer of appropriate size in the pool
+        if let index = pool.firstIndex(where: { $0.length >= size }) {
+            return pool.remove(at: index)
+        }
+        
+        // Create a new buffer if none available
+        guard let device = device else { return nil }
+        return device.makeBuffer(
+            length: size,
+            options: options
+        )
+    }
+
+    private func returnBufferToPool(buffer: MTLBuffer, pool: inout [MTLBuffer]) {
+        // Limit pool size to avoid excessive memory usage
+        if pool.count < 10 { // Keep max 10 buffers in the pool
+            pool.append(buffer)
+        }
+    }
+
     /// Load problem data to the GPU (called once)
     public func loadFlowshopProblemData(
         processingTimes: [[Float]],
@@ -383,18 +407,19 @@ public class FlowshopMetalAccelerator {
             flatJobSequences.append(contentsOf: sequence)
         }
         
-        // Create GPU buffers
+        // Create GPU buffers using buffer pool
         let sequencesBufferSize = MemoryLayout<UInt32>.size * flatJobSequences.count
         let objectivesBufferSize = MemoryLayout<SIMD2<Float>>.size * numSolutions
-        
-        guard let sequencesBuffer = device.makeBuffer(
-            bytes: flatJobSequences,
-            length: sequencesBufferSize,
-            options: .storageModeShared
+
+        guard let sequencesBuffer = getBufferFromPool(
+            pool: &sequencesBufferPool, 
+            size: sequencesBufferSize,
+            options: [.storageModeShared]
         ),
-        let objectivesBuffer = device.makeBuffer(
-            length: objectivesBufferSize,
-            options: .storageModeShared
+        let objectivesBuffer = getBufferFromPool(
+            pool: &objectivesBufferPool, 
+            size: objectivesBufferSize,
+            options: [.storageModeShared]
         ) else {
             print("Failed to create Metal buffers")
             return nil
@@ -457,6 +482,10 @@ public class FlowshopMetalAccelerator {
             results.append((makespan: objective.x, tardiness: objective.y))
         }
         
+        // Return buffers to pool for reuse
+        returnBufferToPool(buffer: sequencesBuffer, pool: &sequencesBufferPool)
+        returnBufferToPool(buffer: objectivesBuffer, pool: &objectivesBufferPool)
+        
         return results
     }
     
@@ -480,17 +509,20 @@ public class FlowshopMetalAccelerator {
             return (sequences: [], objectives: [])
         }
         
-        // Create GPU buffers
+        // Create GPU buffers using buffer pool
         let sequencesBufferSize = MemoryLayout<UInt32>.size * count * Int(numJobs)
         let objectivesBufferSize = MemoryLayout<SIMD2<Float>>.size * count
         
-        guard let sequencesBuffer = device.makeBuffer(
-            length: sequencesBufferSize,
-            options: .storageModeShared
+        // Get buffers from the pool with best performance options for M-series
+        guard let sequencesBuffer = getBufferFromPool(
+            pool: &sequencesBufferPool, 
+            size: sequencesBufferSize,
+            options: [.storageModeShared, .cpuCacheModeWriteCombined]
         ),
-        let objectivesBuffer = device.makeBuffer(
-            length: objectivesBufferSize,
-            options: .storageModeShared
+        let objectivesBuffer = getBufferFromPool(
+            pool: &objectivesBufferPool, 
+            size: objectivesBufferSize,
+            options: [.storageModeShared, .cpuCacheModeWriteCombined]
         ) else {
             print("Failed to create Metal buffers")
             return nil
@@ -567,6 +599,10 @@ public class FlowshopMetalAccelerator {
             sequences.append(sequence)
             objectives.append((makespan: objective.x, tardiness: objective.y))
         }
+        
+        // Return buffers to pool for reuse
+        returnBufferToPool(buffer: sequencesBuffer, pool: &sequencesBufferPool)
+        returnBufferToPool(buffer: objectivesBuffer, pool: &objectivesBufferPool)
         
         return (sequences: sequences, objectives: objectives)
     }
