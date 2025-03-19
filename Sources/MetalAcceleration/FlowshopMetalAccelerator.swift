@@ -63,34 +63,201 @@ public class FlowshopMetalAccelerator {
     private func setupComputePipelines() {
         guard let device = device else { return }
         
-        // Don't use 'try' here as makeDefaultLibrary() isn't actually throwing in this context
-        if let library = device.makeDefaultLibrary() {
-            // Now library is properly unwrapped
+        // Metal shader source code
+        let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+        
+        // Xorshift RNG for GPU
+        uint xorshift(thread uint* state) {
+            uint x = *state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *state = x;
+            return x;
+        }
+        
+        // Fisher-Yates shuffle implementation for GPU
+        void shuffle_sequence(
+            thread uint* sequence,
+            uint length,
+            thread uint* rng_state
+        ) {
+            // Initialize sequence with 0..length-1
+            for (uint i = 0; i < length; i++) {
+                sequence[i] = i;
+            }
+            
+            // Shuffle
+            for (uint i = length - 1; i > 0; i--) {
+                uint j = xorshift(rng_state) % (i + 1);
+                // Swap
+                uint temp = sequence[i];
+                sequence[i] = sequence[j];
+                sequence[j] = temp;
+            }
+        }
+        
+        kernel void generate_and_evaluate_flowshop(
+            device uint* outputSequences,             // Output buffer for generated sequences
+            device const float* processingTimes,      // Processing times matrix (flattened)
+            device const float* priorities,           // Job priorities
+            device const float* deadlines,            // Job deadlines
+            device float2* objectives,                // Output: (makespan, tardiness) for each solution
+            constant uint& numJobs,                   // Number of jobs
+            constant uint& numMachines,               // Number of machines
+            constant uint& numSolutions,              // Number of solutions to generate
+            constant uint& seed,                      // Random seed
+            uint id [[thread_position_in_grid]]       // Thread ID
+        ) {
+            if (id >= numSolutions) return;
+            
+            // Initialize RNG state for this thread
+            uint rng_state = seed + id;
+            
+            // Get pointer to this thread's output sequence
+            device uint* sequence = outputSequences + (id * numJobs);
+            
+            // Generate random permutation using thread-local array
+            thread uint local_sequence[200];  // Max 200 jobs
+            shuffle_sequence(local_sequence, numJobs, &rng_state);
+            
+            // Copy to output buffer
+            for (uint i = 0; i < numJobs; i++) {
+                sequence[i] = local_sequence[i];
+            }
+            
+            // Evaluate the sequence (reuse evaluation code)
+            thread float machineCompletionTimes[10];
+            thread float jobCompletionTimes[200];
+            
+            // Initialize completion times
+            for (uint m = 0; m < numMachines; m++) {
+                machineCompletionTimes[m] = 0.0;
+            }
+            
+            // Process each job through machines
+            for (uint jobIdx = 0; jobIdx < numJobs; jobIdx++) {
+                uint job = local_sequence[jobIdx];
+                
+                for (uint m = 0; m < numMachines; m++) {
+                    uint procTimeIdx = job * numMachines + m;
+                    float processingTime = processingTimes[procTimeIdx];
+                    
+                    if (m == 0) {
+                        machineCompletionTimes[m] += processingTime;
+                    } else {
+                        machineCompletionTimes[m] = max(machineCompletionTimes[m], machineCompletionTimes[m-1]) + processingTime;
+                    }
+                }
+                
+                jobCompletionTimes[job] = machineCompletionTimes[numMachines - 1];
+            }
+            
+            // Calculate objectives
+            float makespan = machineCompletionTimes[numMachines - 1];
+            float totalWeightedTardiness = 0.0;
+            
+            for (uint job = 0; job < numJobs; job++) {
+                float completionTime = jobCompletionTimes[job];
+                float tardiness = max(0.0f, completionTime - deadlines[job]);
+                totalWeightedTardiness += tardiness * priorities[job];
+            }
+            
+            objectives[id] = float2(makespan, totalWeightedTardiness);
+        }
+        
+        // Keep existing evaluate_flowshop kernel
+        kernel void evaluate_flowshop(
+            device const uint* jobSequences,          // Array of job sequences to evaluate
+            device const float* processingTimes,      // Processing times matrix (flattened)
+            device const float* priorities,           // Job priorities
+            device const float* deadlines,            // Job deadlines
+            device float2* objectives,                // Output: (makespan, tardiness) for each solution
+            constant uint& numJobs,                   // Number of jobs
+            constant uint& numMachines,               // Number of machines
+            constant uint& numSolutions,              // Number of solutions to evaluate
+            uint id [[thread_position_in_grid]]       // Thread ID
+        ) {
+            // Check if this thread should evaluate a solution
+            if (id >= numSolutions) {
+                return;
+            }
+            
+            // Get pointer to this thread's job sequence
+            device const uint* sequence = jobSequences + (id * numJobs);
+            
+            // Allocate arrays for completion times on each machine
+            thread float machineCompletionTimes[10];  // Assuming max 10 machines
+            
+            // Initialize machine completion times to 0
+            for (uint m = 0; m < numMachines; m++) {
+                machineCompletionTimes[m] = 0.0;
+            }
+            
+            // Track job completion times (when each job exits the system)
+            thread float jobCompletionTimes[200];    // Assuming max 200 jobs
+            
+            // Process each job in the sequence through all machines
+            for (uint jobIdx = 0; jobIdx < numJobs; jobIdx++) {
+                uint job = sequence[jobIdx];  // Get the actual job index from the sequence
+                
+                // Process the job through each machine
+                for (uint m = 0; m < numMachines; m++) {
+                    // Calculate the processing time index in the flattened array
+                    uint procTimeIdx = job * numMachines + m;
+                    float processingTime = processingTimes[procTimeIdx];
+                    
+                    if (m == 0) {
+                        // First machine: just add to current completion time
+                        machineCompletionTimes[m] += processingTime;
+                    } else {
+                        // Other machines: job can start when both previous machine 
+                        // finishes this job AND this machine finishes previous job
+                        machineCompletionTimes[m] = max(machineCompletionTimes[m], machineCompletionTimes[m-1]) + processingTime;
+                    }
+                }
+                
+                // Record the completion time for this job (when it exits the last machine)
+                jobCompletionTimes[job] = machineCompletionTimes[numMachines - 1];
+            }
+            
+            // Calculate objectives
+            float makespan = machineCompletionTimes[numMachines - 1];  // Time when last job completes
+            float totalWeightedTardiness = 0.0;
+            
+            // Calculate total weighted tardiness
+            for (uint job = 0; job < numJobs; job++) {
+                float completionTime = jobCompletionTimes[job];
+                float deadline = deadlines[job];
+                float tardiness = max(0.0f, completionTime - deadline);
+                float priority = priorities[job];
+                
+                totalWeightedTardiness += tardiness * priority;
+            }
+            
+            // Store the result
+            objectives[id] = float2(makespan, totalWeightedTardiness);
+        }
+        """
+        
+        do {
+            let library = try device.makeLibrary(source: source, options: nil)
+            
+            // Create evaluation pipeline
             if let evaluationFunction = library.makeFunction(name: "evaluate_flowshop") {
-                do {
-                    evaluationPipelineState = try device.makeComputePipelineState(function: evaluationFunction)
-                } catch {
-                    print("Error creating evaluation pipeline state: \(error)")
-                }
+                evaluationPipelineState = try device.makeComputePipelineState(function: evaluationFunction)
+                print("Successfully created evaluation pipeline state")
             }
             
+            // Create generate and evaluate pipeline
             if let generateAndEvaluateFunction = library.makeFunction(name: "generate_and_evaluate_flowshop") {
-                do {
-                    generateAndEvaluatePipelineState = try device.makeComputePipelineState(function: generateAndEvaluateFunction)
-                } catch {
-                    print("Error creating generate and evaluate pipeline state: \(error)")
-                }
+                generateAndEvaluatePipelineState = try device.makeComputePipelineState(function: generateAndEvaluateFunction)
+                print("Successfully created generate and evaluate pipeline state")
             }
-            
-            if let dominanceFunction = library.makeFunction(name: "check_dominance") {
-                do {
-                    dominancePipelineState = try device.makeComputePipelineState(function: dominanceFunction)
-                } catch {
-                    print("Error creating dominance pipeline state: \(error)")
-                }
-            }
-        } else {
-            print("Failed to create Metal library")
+        } catch {
+            print("Failed to create Metal library: \(error)")
         }
     }
     
@@ -156,6 +323,23 @@ public class FlowshopMetalAccelerator {
         return processingTimesBuffer != nil && prioritiesBuffer != nil && deadlinesBuffer != nil
     }
     
+    /// Calculate optimal thread and batch configuration for GPU
+    private func calculateOptimalBatchConfig(numSolutions: Int) -> (batchSize: Int, threadsPerGroup: Int, numBatches: Int) {
+        // Get the SIMD width for optimal GPU utilization (typically 32 on Apple GPUs)
+        let simdWidth = max(32, evaluationPipelineState?.threadExecutionWidth ?? 32)
+        
+        // Calculate threads per group as multiple of SIMD width, max 256 threads
+        let threadsPerGroup = min(256, simdWidth * 4)
+        
+        // Calculate batch size as multiple of threads per group
+        let batchSize = ((numSolutions + threadsPerGroup - 1) / threadsPerGroup) * threadsPerGroup
+        
+        // Calculate number of batches needed
+        let numBatches = (numSolutions + batchSize - 1) / batchSize
+        
+        return (batchSize, threadsPerGroup, numBatches)
+    }
+
     /// Evaluate multiple flowshop solutions in parallel on GPU
     public func evaluateSolutions(
         jobSequences: [[UInt32]]
@@ -171,100 +355,97 @@ public class FlowshopMetalAccelerator {
         }
         
         // Ensure we have solutions to evaluate
-        guard !jobSequences.isEmpty else {
+        let numSolutions = jobSequences.count
+        guard numSolutions > 0 else {
             return []
         }
         
-        // Ensure all solutions have the correct length
-        for sequence in jobSequences {
-            guard sequence.count == numJobs else {
-                print("Invalid job sequence length: \(sequence.count), expected \(numJobs)")
+        // Calculate optimal batch configuration
+        let (batchSize, threadsPerGroup, numBatches) = calculateOptimalBatchConfig(numSolutions: numSolutions)
+        print("GPU config: \(numBatches) batches of \(batchSize) solutions, \(threadsPerGroup) threads per group")
+        
+        // Create result array
+        var results = [(makespan: Float, tardiness: Float)]()
+        results.reserveCapacity(numSolutions)
+        
+        // Process solutions in batches
+        for batchIndex in 0..<numBatches {
+            let batchStart = batchIndex * batchSize
+            let batchEnd = min(batchStart + batchSize, numSolutions)
+            let currentBatchSize = batchEnd - batchStart
+            
+            // Prepare batch data
+            var flatJobSequences = [UInt32]()
+            flatJobSequences.reserveCapacity(batchSize * Int(numJobs))
+            
+            // Fill batch with actual solutions
+            for i in batchStart..<batchEnd {
+                flatJobSequences.append(contentsOf: jobSequences[i])
+            }
+            
+            // Pad the batch if needed
+            while flatJobSequences.count < batchSize * Int(numJobs) {
+                flatJobSequences.append(contentsOf: jobSequences[0])  // Pad with first sequence
+            }
+            
+            // Create GPU buffers for this batch
+            guard let sequencesBuffer = device.makeBuffer(
+                bytes: flatJobSequences,
+                length: MemoryLayout<UInt32>.size * flatJobSequences.count,
+                options: .storageModeShared
+            ),
+            let objectivesBuffer = device.makeBuffer(
+                length: MemoryLayout<SIMD2<Float>>.size * batchSize,
+                options: .storageModeShared
+            ) else {
+                print("Failed to create Metal buffers for batch \(batchIndex)")
                 return nil
             }
-        }
-        
-        let numSolutions = jobSequences.count
-        
-        // Flatten job sequences for the GPU buffer
-        var flatJobSequences = [UInt32]()
-        flatJobSequences.reserveCapacity(numSolutions * Int(numJobs))
-        
-        for sequence in jobSequences {
-            flatJobSequences.append(contentsOf: sequence)
-        }
-        
-        // Create GPU buffers
-        let sequencesBufferSize = MemoryLayout<UInt32>.size * flatJobSequences.count
-        let objectivesBufferSize = MemoryLayout<SIMD2<Float>>.size * numSolutions
-        
-        guard let sequencesBuffer = device.makeBuffer(
-            bytes: flatJobSequences,
-            length: sequencesBufferSize,
-            options: .storageModeShared
-        ),
-        let objectivesBuffer = device.makeBuffer(
-            length: objectivesBufferSize,
-            options: .storageModeShared
-        ) else {
-            print("Failed to create Metal buffers")
-            return nil
-        }
-        
-        // Number of solutions as UInt32 for the kernel
-        var numSolutionsUInt32 = UInt32(numSolutions)
-        
-        // Create a command buffer
-        guard let commandBuffer = commandQueue.makeCommandBuffer(),
-              let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
-            print("Failed to create command buffer or encoder")
-            return nil
-        }
-        
-        // Configure the compute encoder
-        computeEncoder.setComputePipelineState(evaluationPipelineState)
-        computeEncoder.setBuffer(sequencesBuffer, offset: 0, index: 0)
-        computeEncoder.setBuffer(processingTimesBuffer, offset: 0, index: 1)
-        computeEncoder.setBuffer(prioritiesBuffer, offset: 0, index: 2)
-        computeEncoder.setBuffer(deadlinesBuffer, offset: 0, index: 3)
-        computeEncoder.setBuffer(objectivesBuffer, offset: 0, index: 4)
-        computeEncoder.setBytes(&numJobs, length: MemoryLayout<UInt32>.size, index: 5)
-        computeEncoder.setBytes(&numMachines, length: MemoryLayout<UInt32>.size, index: 6)
-        computeEncoder.setBytes(&numSolutionsUInt32, length: MemoryLayout<UInt32>.size, index: 7)
-        
-        // Calculate grid and threadgroup sizes
-        let threadExecutionWidth = evaluationPipelineState.threadExecutionWidth
-        let maxThreadsPerThreadgroup = min(
-            evaluationPipelineState.maxTotalThreadsPerThreadgroup,
-            threadExecutionWidth * 2
-        )
-        
-        let threadsPerThreadgroup = MTLSize(
-            width: maxThreadsPerThreadgroup,
-            height: 1,
-            depth: 1
-        )
-        
-        let threadgroupsPerGrid = MTLSize(
-            width: (numSolutions + maxThreadsPerThreadgroup - 1) / maxThreadsPerThreadgroup,
-            height: 1,
-            depth: 1
-        )
-        
-        // Dispatch the compute kernel
-        computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
-        computeEncoder.endEncoding()
-        
-        // Execute and wait for completion
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        
-        // Read back results from GPU
-        var results = [(makespan: Float, tardiness: Float)]()
-        let objectivesPtr = objectivesBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: numSolutions)
-        
-        for i in 0..<numSolutions {
-            let objective = objectivesPtr[i]
-            results.append((makespan: objective.x, tardiness: objective.y))
+            
+            // Create command buffer and encoder
+            guard let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                print("Failed to create command buffer or encoder")
+                return nil
+            }
+            
+            // Configure compute encoder
+            computeEncoder.setComputePipelineState(evaluationPipelineState)
+            computeEncoder.setBuffer(sequencesBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(processingTimesBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(prioritiesBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(deadlinesBuffer, offset: 0, index: 3)
+            computeEncoder.setBuffer(objectivesBuffer, offset: 0, index: 4)
+            computeEncoder.setBytes(&numJobs, length: MemoryLayout<UInt32>.size, index: 5)
+            computeEncoder.setBytes(&numMachines, length: MemoryLayout<UInt32>.size, index: 6)
+            
+            var batchSizeUInt32 = UInt32(batchSize)
+            computeEncoder.setBytes(&batchSizeUInt32, length: MemoryLayout<UInt32>.size, index: 7)
+            
+            // Configure thread sizes
+            let threadsPerThreadgroup = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
+            let numThreadgroups = MTLSize(
+                width: (batchSize + threadsPerGroup - 1) / threadsPerGroup,
+                height: 1,
+                depth: 1
+            )
+            
+            // Dispatch compute kernel
+            computeEncoder.dispatchThreadgroups(numThreadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+            computeEncoder.endEncoding()
+            
+            // Execute batch
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            
+            // Read results
+            let objectivesPtr = objectivesBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: batchSize)
+            
+            // Only append actual results (not padding)
+            for i in 0..<currentBatchSize {
+                let objective = objectivesPtr[i]
+                results.append((makespan: objective.x, tardiness: objective.y))
+            }
         }
         
         return results

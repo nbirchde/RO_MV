@@ -122,18 +122,22 @@ public class FlowshopGPUGeneticAlgorithm {
         if let (sequences, objectives) = metalAccelerator.generateAndEvaluateRandomSolutions(count: populationSize) {
             print("GPU generated \(sequences.count) solutions")
             
-            // Convert GPU solutions to chromosomes
+            // Convert GPU solutions to chromosomes with their objectives
             var initialPopulation: [FlowshopChromosome] = []
             initialPopulation.reserveCapacity(populationSize)
             
-            // Convert UInt32 sequences to Int for FlowshopChromosome
+            // Convert UInt32 sequences to Int for FlowshopChromosome and use GPU-computed objectives
             for i in 0..<sequences.count {
                 let jobSequence = sequences[i].map { Int($0) }
+                let (makespan, tardiness) = objectives[i]
+                
+                // Create chromosome with precomputed objectives
                 let chromosome = FlowshopChromosome(
                     jobSequence: jobSequence,
                     processingTimes: problemData.processingTimes,
                     priorities: problemData.priorities,
-                    deadlines: problemData.deadlines
+                    deadlines: problemData.deadlines,
+                    precomputedObjectives: (makespan: Double(makespan), tardiness: Double(tardiness))
                 )
                 initialPopulation.append(chromosome)
             }
@@ -142,9 +146,12 @@ public class FlowshopGPUGeneticAlgorithm {
             population = initialPopulation
             
             // Add initial population to the Pareto front
+            let frontStart = Date()
             for solution in initialPopulation {
                 _ = paretoFront.add(solution)
             }
+            let frontTime = Date().timeIntervalSince(frontStart)
+            print("Pareto front initialization completed in \(String(format: "%.3f", frontTime))s")
             
             let gpuTime = Date().timeIntervalSince(startTime)
             print("GPU initialization completed in \(String(format: "%.2f", gpuTime)) seconds")
@@ -199,8 +206,107 @@ public class FlowshopGPUGeneticAlgorithm {
     
     /// Evolve a single generation
     private func evolveOneGeneration() {
-        // For now, just use CPU evolution
-        evolveOneGenerationCPU()
+        let generationStart = Date()
+        
+        if useGPU {
+            print("Starting GPU evolution cycle...")
+            let gpuStart = Date()
+            evolveOneGenerationGPU()
+            metrics.gpuTimeElapsed += Date().timeIntervalSince(gpuStart)
+        } else {
+            print("Starting CPU evolution cycle...")
+            let cpuStart = Date()
+            evolveOneGenerationCPU()
+            metrics.cpuTimeElapsed += Date().timeIntervalSince(cpuStart)
+        }
+        
+        metrics.timeElapsed += Date().timeIntervalSince(generationStart)
+    }
+    
+    /// Evolve one generation using GPU acceleration
+    private func evolveOneGenerationGPU() {
+        let start = Date()
+        
+        // Apply elitism - add best solutions directly to next generation
+        var offspring: [FlowshopChromosome] = []
+        if elitismCount > 0 {
+            let elites = Array(paretoFront.solutions.prefix(min(elitismCount, paretoFront.count)))
+            offspring.append(contentsOf: elites)
+        }
+        
+        // Create remainder of offspring through selection and crossover
+        let currentPopulation = population
+        while offspring.count < populationSize {
+            // Tournament selection for parents
+            let parent1 = tournamentSelection(from: currentPopulation)
+            let parent2 = tournamentSelection(from: currentPopulation)
+            
+            // Apply crossover with some probability
+            if Double.random(in: 0...1) < crossoverRate {
+                offspring.append(parent1.crossover(with: parent2))
+            } else {
+                // No crossover, add one parent randomly
+                offspring.append(Bool.random() ? parent1 : parent2)
+            }
+        }
+        
+        // Apply mutation to non-elite offspring
+        var mutatedOffspring: [FlowshopChromosome] = []
+        mutatedOffspring.reserveCapacity(populationSize)
+        
+        // First, add elites without mutation
+        let eliteCount = min(elitismCount, offspring.count)
+        mutatedOffspring.append(contentsOf: offspring.prefix(eliteCount))
+        
+        // Apply mutation to non-elite offspring
+        for i in eliteCount..<offspring.count {
+            if Double.random(in: 0...1) < 0.2 { // 20% chance to apply mutation
+                mutatedOffspring.append(offspring[i].mutate(mutationRate: mutationRate))
+            } else {
+                mutatedOffspring.append(offspring[i])
+            }
+        }
+        
+        // Convert chromosomes to job sequences for GPU evaluation
+        let sequencesToEvaluate = mutatedOffspring.map { $0.jobSequence.map { UInt32($0) } }
+        
+        print("Evaluating \(sequencesToEvaluate.count) solutions on GPU...")
+        let evalStart = Date()
+        
+        // Evaluate all solutions on GPU
+        if let objectives = metalAccelerator.evaluateSolutions(jobSequences: sequencesToEvaluate) {
+            let evalTime = Date().timeIntervalSince(evalStart)
+            print("GPU evaluation completed in \(String(format: "%.3f", evalTime))s")
+            
+            // Create new chromosomes with GPU-computed objectives
+            var evaluatedOffspring: [FlowshopChromosome] = []
+            evaluatedOffspring.reserveCapacity(mutatedOffspring.count)
+            
+            for (i, chromosome) in mutatedOffspring.enumerated() {
+                let (makespan, tardiness) = objectives[i]
+                let evaluated = chromosome.withObjectives(
+                    makespan: Double(makespan),
+                    tardiness: Double(tardiness)
+                )
+                evaluatedOffspring.append(evaluated)
+            }
+            
+            // Replace population and update Pareto front
+            population = evaluatedOffspring
+            
+            let frontStart = Date()
+            for solution in evaluatedOffspring {
+                _ = paretoFront.add(solution)
+            }
+            let frontTime = Date().timeIntervalSince(frontStart)
+            print("Pareto front update completed in \(String(format: "%.3f", frontTime))s")
+        } else {
+            print("GPU evaluation failed, falling back to CPU")
+            evolveOneGenerationCPU()
+        }
+        
+        let elapsed = Date().timeIntervalSince(start)
+        print("GPU generation took \(String(format: "%.3f", elapsed))s")
     }
     
     /// Evolve one generation using CPU

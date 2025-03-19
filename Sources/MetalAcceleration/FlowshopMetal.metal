@@ -1,8 +1,8 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Helper function: Evaluate a single flowshop sequence
-// Returns a float2 containing (makespan, tardiness)
+/// Helper function: Evaluate a single flowshop sequence
+/// Returns a float2 containing (makespan, tardiness)
 float2 evaluate_single_flowshop(
     constant uint* sequence,                  // Job sequence (permutation)
     constant float* processingTimes,          // Processing times matrix (flattened)
@@ -63,7 +63,7 @@ float2 evaluate_single_flowshop(
     return float2(makespan, totalWeightedTardiness);
 }
 
-// Xorshift random number generator for GPU
+/// Xorshift random number generator for GPU
 uint xorshift_rng(thread uint* state) {
     uint x = *state;
     x ^= x << 13;
@@ -73,7 +73,7 @@ uint xorshift_rng(thread uint* state) {
     return x;
 }
 
-// Generate a random permutation using the Fisher-Yates shuffle
+/// Generate a random permutation using the Fisher-Yates shuffle
 void generate_permutation(
     thread uint* sequence,
     uint length,
@@ -94,7 +94,7 @@ void generate_permutation(
     }
 }
 
-// Kernel: Evaluate multiple flowshop solutions in parallel
+/// Kernel: Evaluate multiple flowshop solutions in parallel
 kernel void evaluate_flowshop(
     device const uint* jobSequences,          // Array of job sequences to evaluate
     device const float* processingTimes,      // Processing times matrix (flattened)
@@ -128,7 +128,7 @@ kernel void evaluate_flowshop(
     objectives[id] = result;
 }
 
-// Kernel: Generate and evaluate random flowshop solutions in parallel
+/// Kernel: Generate and evaluate random flowshop solutions in parallel
 kernel void generate_and_evaluate_flowshop(
     device uint* outputSequences,             // Output: Generated job sequences
     device const float* processingTimes,      // Processing times matrix (flattened)
@@ -175,7 +175,7 @@ kernel void generate_and_evaluate_flowshop(
     objectives[id] = result;
 }
 
-// Kernel: Check dominance relationships between solutions (for Pareto front)
+/// Kernel: Check dominance relationships between solutions (for Pareto front)
 kernel void check_dominance(
     device const float2* objectives,          // Array of objective values (makespan, tardiness)
     device int* dominanceMatrix,              // Output: dominance matrix (1 if row dominates column)

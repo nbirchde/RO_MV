@@ -42,6 +42,53 @@ public struct FlowshopChromosome: Solution {
         ]
     }
     
+    /// Initialize with a specific job sequence and problem data, optionally with precomputed objectives
+    public init(
+        jobSequence: [Int],
+        processingTimes: [[Double]],
+        priorities: [Double],
+        deadlines: [Double],
+        precomputedObjectives: (makespan: Double, tardiness: Double)? = nil
+    ) {
+        self.id = UUID()
+        self.jobSequence = jobSequence
+        self.processingTimes = processingTimes
+        self.priorities = priorities
+        self.deadlines = deadlines
+        
+        if let objectives = precomputedObjectives {
+            // Use precomputed objectives
+            self.criteria = [
+                NumericCriterion(objectives.makespan, lowerIsBetter: true),
+                NumericCriterion(objectives.tardiness, lowerIsBetter: true)
+            ]
+        } else {
+            // Calculate objectives
+            let (makespan, totalWeightedTardiness) = FlowshopChromosome.calculateObjectives(
+                jobSequence: jobSequence,
+                processingTimes: processingTimes,
+                priorities: priorities,
+                deadlines: deadlines
+            )
+            
+            self.criteria = [
+                NumericCriterion(makespan, lowerIsBetter: true),
+                NumericCriterion(totalWeightedTardiness, lowerIsBetter: true)
+            ]
+        }
+    }
+    
+    /// Create a new chromosome with the same sequence but updated objectives
+    public func withObjectives(makespan: Double, tardiness: Double) -> FlowshopChromosome {
+        return FlowshopChromosome(
+            jobSequence: self.jobSequence,
+            processingTimes: self.processingTimes,
+            priorities: self.priorities,
+            deadlines: self.deadlines,
+            precomputedObjectives: (makespan, tardiness)
+        )
+    }
+    
     /// Create a random chromosome with the provided problem data
     public static func random(numJobs: Int, processingTimes: [[Double]], priorities: [Double], deadlines: [Double]) -> FlowshopChromosome {
         // Generate a random permutation of jobs

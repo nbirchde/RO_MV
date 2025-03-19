@@ -30,8 +30,10 @@ let package = Package(
         .target(
             name: "MetalAcceleration",
             dependencies: ["OptimizationCore"],
+            exclude: ["Resources/FlowshopShaders.metal"],  // Exclude the resource version
+            sources: ["FlowshopMetalAccelerator.swift"],
             resources: [
-                .process("Resources")
+                .copy("FlowshopMetal.metal")  // Include the main Metal file as a resource
             ]
         )
     ]
