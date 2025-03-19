@@ -446,6 +446,87 @@ public class FlowshopGPUGeneticAlgorithm {
         return bestCandidate
     }
     
+    // Add this method to create a diverse subset from a larger population
+    private func selectDiverseSubset(from solutions: [FlowshopChromosome], count: Int) -> [FlowshopChromosome] {
+        guard solutions.count > count else { return solutions }
+        
+        // First, add some of the best solutions by each objective
+        var selected: [FlowshopChromosome] = []
+        
+        // Add best makespan solutions
+        let makespanSorted = solutions.sorted { a, b in
+            let makespan1 = (a.criteria[0] as! NumericCriterion).value
+            let makespan2 = (b.criteria[0] as! NumericCriterion).value
+            return makespan1 < makespan2
+        }
+        
+        // Add best tardiness solutions
+        let tardinessSorted = solutions.sorted { a, b in
+            let tardiness1 = (a.criteria[1] as! NumericCriterion).value
+            let tardiness2 = (b.criteria[1] as! NumericCriterion).value
+            return tardiness1 < tardiness2
+        }
+        
+        // Add extremes and some in between
+        selected.append(contentsOf: makespanSorted.prefix(count/4))
+        selected.append(contentsOf: tardinessSorted.prefix(count/4))
+        
+        // Use remaining slots for diversity using a grid approach
+        if selected.count < count {
+            // Find ranges to normalize
+            let makespanMin = (makespanSorted.first!.criteria[0] as! NumericCriterion).value
+            let makespanMax = (makespanSorted.last!.criteria[0] as! NumericCriterion).value
+            let makespanRange = makespanMax - makespanMin
+            
+            let tardinessMin = (tardinessSorted.first!.criteria[1] as! NumericCriterion).value
+            let tardinessMax = (tardinessSorted.last!.criteria[1] as! NumericCriterion).value
+            let tardinessRange = tardinessMax - tardinessMin
+            
+            // Create grid cells
+            let gridSize = 10  // 10x10 grid
+            var grid = Array(repeating: Array(repeating: false, count: gridSize), count: gridSize)
+            
+            // Mark cells that already have solutions
+            for sol in selected {
+                let makespan = (sol.criteria[0] as! NumericCriterion).value
+                let tardiness = (sol.criteria[1] as! NumericCriterion).value
+                
+                // Calculate grid cell
+                let i = min(gridSize-1, Int((makespan - makespanMin) / makespanRange * Double(gridSize)))
+                let j = min(gridSize-1, Int((tardiness - tardinessMin) / tardinessRange * Double(gridSize)))
+                
+                grid[i][j] = true
+            }
+            
+            // Add solutions from empty grid cells
+            for sol in solutions {
+                if selected.count >= count { break }
+                
+                let makespan = (sol.criteria[0] as! NumericCriterion).value
+                let tardiness = (sol.criteria[1] as! NumericCriterion).value
+                
+                // Calculate grid cell
+                let i = min(gridSize-1, Int((makespan - makespanMin) / makespanRange * Double(gridSize)))
+                let j = min(gridSize-1, Int((tardiness - tardinessMin) / tardinessRange * Double(gridSize)))
+                
+                if !grid[i][j] && !selected.contains(sol) {
+                    selected.append(sol)
+                    grid[i][j] = true
+                }
+            }
+        }
+        
+        // Fill any remaining spots randomly
+        var remaining = Array(Set(solutions).subtracting(Set(selected)))
+        while selected.count < count && !remaining.isEmpty {
+            let randomIndex = Int.random(in: 0..<remaining.count)
+            selected.append(remaining[randomIndex])
+            remaining.remove(at: randomIndex)
+        }
+        
+        return selected
+    }
+    
     /// Get current metrics
     public func getMetrics() -> Metrics {
         return metrics
