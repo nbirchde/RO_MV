@@ -2,7 +2,7 @@ import Foundation
 import OptimizationCore
 
 /// Represents a flowshop scheduling solution as a permutation of jobs
-public struct FlowshopChromosome: Chromosome {
+public struct FlowshopChromosome: Solution {
     // Unique identifier for the chromosome
     public let id: UUID
     
@@ -54,11 +54,6 @@ public struct FlowshopChromosome: Chromosome {
             priorities: priorities,
             deadlines: deadlines
         )
-    }
-    
-    /// Create a random chromosome (for initial population) - this is required by the Chromosome protocol
-    public static func random() -> FlowshopChromosome {
-        fatalError("Use random(numJobs:processingTimes:priorities:deadlines:) instead")
     }
     
     /// Calculate the makespan and total weighted tardiness for a given job sequence

@@ -36,9 +36,10 @@ print("Available CPU cores: \(ProcessInfo.processInfo.activeProcessorCount)")
 print("Physical memory: \(ProcessInfo.processInfo.physicalMemory / (1024 * 1024)) MB")
 
 // Check if Metal GPU acceleration is available
-if MetalAccelerator.shared.isMetalAvailable {
+let metalAccelerator = FlowshopMetalAccelerator.shared
+if metalAccelerator.isMetalAvailable {
     print("\n=== Metal GPU Information ===")
-    print(MetalAccelerator.shared.deviceInfo())
+    print(metalAccelerator.deviceInfo())
 }
 
 // Run the flowshop solver

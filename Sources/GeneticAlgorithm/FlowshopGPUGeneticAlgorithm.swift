@@ -1,6 +1,6 @@
 import Foundation
 import OptimizationCore
-import ObjectiveC
+import MetalAcceleration
 
 /// A GPU-accelerated genetic algorithm for flowshop scheduling problems
 public class FlowshopGPUGeneticAlgorithm {
@@ -20,7 +20,7 @@ public class FlowshopGPUGeneticAlgorithm {
     private let paretoFront = ParetoFront<FlowshopChromosome>()
     
     // Metal accelerator for GPU acceleration
-    private let metalAccelerator: Any? // Will be MetalAccelerator.shared at runtime
+    private let metalAccelerator: FlowshopMetalAccelerator
     
     // Performance metrics
     public struct Metrics {
@@ -50,41 +50,32 @@ public class FlowshopGPUGeneticAlgorithm {
         self.crossoverRate = crossoverRate
         self.elitismCount = min(elitismCount, populationSize / 2) // Prevent elitism count from being too large
         self.problemData = problemData
+        self.metalAccelerator = FlowshopMetalAccelerator.shared
         
-        // Initialize Metal accelerator dynamically to avoid circular dependency
-        let acceleratorClass = NSClassFromString("ParetoOptimization.FlowshopMetalAccelerator") as? NSObject.Type
-        let shared = acceleratorClass?.value(forKey: "shared")
+        // Initialize problem data on GPU
+        let processingTimes = problemData.processingTimes.map { $0.map { Float($0) } }
+        let priorities = problemData.priorities.map { Float($0) }
+        let deadlines = problemData.deadlines.map { Float($0) }
         
-        if let accelerator = shared as? AnyObject,
-           let isAvailable = accelerator.value(forKey: "isMetalAvailable") as? Bool, 
-           isAvailable {
-            self.metalAccelerator = accelerator
-            
-            // Initialize problem data on GPU
-            let selector = NSSelectorFromString("initializeProblemData:")
-            if (accelerator as AnyObject).responds(to: selector) {
-                let initMethod = (accelerator as AnyObject).method(for: selector)
-                typealias InitFunction = (AnyObject, Selector, FlowshopProblemData) -> Bool
-                let initImpl = unsafeBitCast(initMethod, to: InitFunction.self)
-                self.useGPU = initImpl(accelerator as AnyObject, selector, problemData)
-            } else {
-                self.useGPU = false
-            }
-            
-            print("GPU acceleration \(useGPU ? "enabled" : "disabled")")
-        } else {
-            self.metalAccelerator = nil
-            self.useGPU = false
-            print("GPU acceleration not available")
-        }
+        let gpuInitSuccess = metalAccelerator.loadFlowshopProblemData(
+            processingTimes: processingTimes,
+            priorities: priorities,
+            deadlines: deadlines
+        )
+        
+        self.useGPU = gpuInitSuccess
+        print("GPU acceleration \(useGPU ? "enabled" : "disabled")")
     }
     
     /// Initialize the population with random chromosomes
     private func initializePopulation() {
         print("Initializing population of \(populationSize) chromosomes...")
         
-        // For now, just use CPU initialization
-        initializePopulationCPU()
+        if useGPU {
+            initializePopulationGPU()
+        } else {
+            initializePopulationCPU()
+        }
         
         print("Initialization complete. Population size: \(population.count), Pareto front size: \(paretoFront.count)")
     }
@@ -121,6 +112,47 @@ public class FlowshopGPUGeneticAlgorithm {
         
         let totalTime = Date().timeIntervalSince(startTime)
         print("CPU initialization completed in \(String(format: "%.2f", totalTime)) seconds")
+    }
+    
+    /// Initialize population on the GPU
+    private func initializePopulationGPU() {
+        let startTime = Date()
+        
+        // Use GPU to generate and evaluate initial population
+        if let (sequences, objectives) = metalAccelerator.generateAndEvaluateRandomSolutions(count: populationSize) {
+            print("GPU generated \(sequences.count) solutions")
+            
+            // Convert GPU solutions to chromosomes
+            var initialPopulation: [FlowshopChromosome] = []
+            initialPopulation.reserveCapacity(populationSize)
+            
+            // Convert UInt32 sequences to Int for FlowshopChromosome
+            for i in 0..<sequences.count {
+                let jobSequence = sequences[i].map { Int($0) }
+                let chromosome = FlowshopChromosome(
+                    jobSequence: jobSequence,
+                    processingTimes: problemData.processingTimes,
+                    priorities: problemData.priorities,
+                    deadlines: problemData.deadlines
+                )
+                initialPopulation.append(chromosome)
+            }
+            
+            // Store the population
+            population = initialPopulation
+            
+            // Add initial population to the Pareto front
+            for solution in initialPopulation {
+                _ = paretoFront.add(solution)
+            }
+            
+            let gpuTime = Date().timeIntervalSince(startTime)
+            print("GPU initialization completed in \(String(format: "%.2f", gpuTime)) seconds")
+            metrics.gpuTimeElapsed += gpuTime
+        } else {
+            print("GPU initialization failed, falling back to CPU")
+            initializePopulationCPU()
+        }
     }
     
     /// Evolve the population for a specified number of generations

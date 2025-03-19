@@ -10,7 +10,7 @@ public class FlowshopMetalAccelerator {
     // Metal properties
     private let device: MTLDevice?
     private let commandQueue: MTLCommandQueue?
-    private var isMetalAvailable: Bool
+    public private(set) var isMetalAvailable: Bool
     
     // Problem data
     private var numJobs: UInt32 = 0
@@ -43,6 +43,20 @@ public class FlowshopMetalAccelerator {
             self.commandQueue = nil
             self.isMetalAvailable = false
         }
+    }
+    
+    /// Get information about the Metal device being used
+    public func deviceInfo() -> String {
+        guard let device = device else {
+            return "No Metal device available"
+        }
+        
+        var info = "GPU: \(device.name)"
+        info += "\nMax threads per threadgroup: \(device.maxThreadsPerThreadgroup.width)x\(device.maxThreadsPerThreadgroup.height)"
+        info += "\nRecommended max working set size: \(Double(device.recommendedMaxWorkingSetSize) / (1024.0 * 1024.0)) MB"
+        info += "\nHas unified memory: \(device.hasUnifiedMemory)"
+        
+        return info
     }
     
     /// Set up Metal compute pipelines
