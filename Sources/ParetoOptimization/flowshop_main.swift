@@ -39,7 +39,7 @@ public func solveFlowshopProblem() {
     // Configuration parameters - tuned for better performance
     let populationSize = 1000
     let generations = 100
-    let mutationRate = 0.05
+    let mutationRate = 0.15
     let crossoverRate = 0.8
     let elitismCount = 50
     

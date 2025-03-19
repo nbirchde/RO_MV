@@ -105,7 +105,7 @@ if __name__ == "__main__":
     script_dir = Path(__file__).parent
     
     # Define paths relative to script location
-    solutions_file = script_dir / "birch_delacalle_nicholas.csv"
+    solutions_file = script_dir / "sol.csv"
     instance_file = script_dir / "instance.csv"
     output_file = script_dir / "pareto_front.png"
     

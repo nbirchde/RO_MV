@@ -206,13 +206,44 @@ public struct FlowshopChromosome: Solution {
     /// Create a mutated version of this chromosome
     public func mutate(mutationRate: Double) -> FlowshopChromosome {
         var mutated = jobSequence
+        let jobCount = jobSequence.count
         
-        // Apply swap mutation - randomly swap jobs with probability mutationRate
-        for i in 0..<jobSequence.count {
+        // Apply swap mutation with guaranteed minimum changes
+        let minSwaps = max(1, Int(Double(jobCount) * 0.05))  // At least 5% of jobs, minimum 1
+        var swapsPerformed = 0
+        
+        // First pass: apply random swaps based on mutation rate
+        for i in 0..<jobCount {
             if Double.random(in: 0...1) < mutationRate {
-                let j = Int.random(in: 0..<jobSequence.count)
+                let j = Int.random(in: 0..<jobCount)
+                mutated.swapAt(i, j)
+                swapsPerformed += 1
+            }
+        }
+        
+        // Second pass: if we didn't reach minimum swaps, add more
+        if swapsPerformed < minSwaps {
+            for _ in 0..<(minSwaps - swapsPerformed) {
+                let i = Int.random(in: 0..<jobCount)
+                let j = Int.random(in: 0..<jobCount)
                 mutated.swapAt(i, j)
             }
+        }
+        
+        // Alternative mutation: insert operation (50% chance if we've already done swaps)
+        if swapsPerformed > 0 && Bool.random() {
+            let from = Int.random(in: 0..<jobCount)
+            var to = Int.random(in: 0..<jobCount)
+            
+            // Ensure to ≠ from
+            while to == from {
+                to = Int.random(in: 0..<jobCount)
+            }
+            
+            // Move element at 'from' to 'to'
+            let temp = mutated[from]
+            mutated.remove(at: from)
+            mutated.insert(temp, at: to)
         }
         
         // Return the mutated chromosome
@@ -226,12 +257,12 @@ public struct FlowshopChromosome: Solution {
     
     // Hashable implementation
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
+        hasher.combine(jobSequence)
     }
     
     // Equatable implementation
     public static func == (lhs: FlowshopChromosome, rhs: FlowshopChromosome) -> Bool {
-        return lhs.id == rhs.id
+        return lhs.jobSequence == rhs.jobSequence
     }
     
     /// Get a description of this solution

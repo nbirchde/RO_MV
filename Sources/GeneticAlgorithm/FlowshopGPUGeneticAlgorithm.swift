@@ -260,7 +260,7 @@ public class FlowshopGPUGeneticAlgorithm {
         
         // Apply mutation to non-elite offspring
         for i in eliteCount..<offspring.count {
-            if Double.random(in: 0...1) < 0.2 { // 20% chance to apply mutation
+            if Double.random(in: 0...1) < 0.5 { // Increased from 0.2 to 0.5 for more diversity
                 mutatedOffspring.append(offspring[i].mutate(mutationRate: mutationRate))
             } else {
                 mutatedOffspring.append(offspring[i])
@@ -362,7 +362,7 @@ public class FlowshopGPUGeneticAlgorithm {
         
         // Apply mutation to non-elite offspring
         for i in eliteCount..<offspring.count {
-            if Double.random(in: 0...1) < 0.2 { // 20% chance to apply mutation
+            if Double.random(in: 0...1) < 0.5 { // Increased from 0.2 to 0.5 for more diversity
                 mutatedOffspring.append(offspring[i].mutate(mutationRate: mutationRate))
             } else {
                 mutatedOffspring.append(offspring[i])
