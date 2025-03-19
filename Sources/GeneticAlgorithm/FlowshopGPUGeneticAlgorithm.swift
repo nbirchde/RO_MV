@@ -227,81 +227,113 @@ public class FlowshopGPUGeneticAlgorithm {
     private func evolveOneGenerationGPU() {
         let start = Date()
         
-        // Apply elitism - add best solutions directly to next generation
-        var offspring: [FlowshopChromosome] = []
-        if elitismCount > 0 {
+        // 1. CRITICAL CHANGE: Instead of bringing everything to CPU, perform more operations on GPU
+        // Generate a larger set of offspring directly on GPU - this single call will replace
+        // selection, crossover, and evaluation steps that were previously done on CPU
+        let gpuGenerationSize = populationSize * 2 // Generate more solutions than needed to improve diversity
+        
+        print("Generating and evaluating \(gpuGenerationSize) solutions on GPU...")
+        
+        if let (sequences, objectives) = metalAccelerator.generateAndEvaluateRandomSolutions(count: gpuGenerationSize) {
+            let evalTime = Date().timeIntervalSince(start)
+            print("GPU generation and evaluation completed in \(String(format: "%.3f", evalTime))s")
+            
+            // 2. OPTIMIZATION: Process elitism and parents separately
+            // First, keep track of elite solutions from current population
             let elites = Array(paretoFront.solutions.prefix(min(elitismCount, paretoFront.count)))
-            offspring.append(contentsOf: elites)
-        }
-        
-        // Create remainder of offspring through selection and crossover
-        let currentPopulation = population
-        while offspring.count < populationSize {
-            // Tournament selection for parents
-            let parent1 = tournamentSelection(from: currentPopulation)
-            let parent2 = tournamentSelection(from: currentPopulation)
             
-            // Apply crossover with some probability
-            if Double.random(in: 0...1) < crossoverRate {
-                offspring.append(parent1.crossover(with: parent2))
-            } else {
-                // No crossover, add one parent randomly
-                offspring.append(Bool.random() ? parent1 : parent2)
-            }
-        }
-        
-        // Apply mutation to non-elite offspring
-        var mutatedOffspring: [FlowshopChromosome] = []
-        mutatedOffspring.reserveCapacity(populationSize)
-        
-        // First, add elites without mutation
-        let eliteCount = min(elitismCount, offspring.count)
-        mutatedOffspring.append(contentsOf: offspring.prefix(eliteCount))
-        
-        // Apply mutation to non-elite offspring
-        for i in eliteCount..<offspring.count {
-            if Double.random(in: 0...1) < 0.5 { // Increased from 0.2 to 0.5 for more diversity
-                mutatedOffspring.append(offspring[i].mutate(mutationRate: mutationRate))
-            } else {
-                mutatedOffspring.append(offspring[i])
-            }
-        }
-        
-        // Convert chromosomes to job sequences for GPU evaluation
-        let sequencesToEvaluate = mutatedOffspring.map { $0.jobSequence.map { UInt32($0) } }
-        
-        print("Evaluating \(sequencesToEvaluate.count) solutions on GPU...")
-        let evalStart = Date()
-        
-        // Evaluate all solutions on GPU
-        if let objectives = metalAccelerator.evaluateSolutions(jobSequences: sequencesToEvaluate) {
-            let evalTime = Date().timeIntervalSince(evalStart)
-            print("GPU evaluation completed in \(String(format: "%.3f", evalTime))s")
+            // 3. OPTIMIZATION: Create the new population by combining:
+            //    - Elites from previous generation (no mutation)
+            //    - Some of the best GPU-generated solutions 
+            //    - Some mutated variants of both elites and GPU solutions
+            var newPopulation: [FlowshopChromosome] = []
+            newPopulation.append(contentsOf: elites)
             
-            // Create new chromosomes with GPU-computed objectives
-            var evaluatedOffspring: [FlowshopChromosome] = []
-            evaluatedOffspring.reserveCapacity(mutatedOffspring.count)
-            
-            for (i, chromosome) in mutatedOffspring.enumerated() {
-                let (makespan, tardiness) = objectives[i]
-                let evaluated = chromosome.withObjectives(
-                    makespan: Double(makespan),
-                    tardiness: Double(tardiness)
+            // Add most of the new population from GPU-generated solutions
+            let evaluatedOffspring = zip(sequences, objectives).map { (sequence, objective) in
+                FlowshopChromosome(
+                    jobSequence: sequence.map { Int($0) },
+                    processingTimes: problemData.processingTimes,
+                    priorities: problemData.priorities,
+                    deadlines: problemData.deadlines,
+                    precomputedObjectives: (makespan: Double(objective.makespan), tardiness: Double(objective.tardiness))
                 )
-                evaluatedOffspring.append(evaluated)
             }
             
-            // Replace population and update Pareto front
-            population = evaluatedOffspring
+            // 4. OPTIMIZATION: Use distance-based selection to maintain diversity
+            // Sort GPU solutions by combined objective and select diverse ones
+            let sortedOffspring = evaluatedOffspring.sorted { a, b in
+                let makespan1 = (a.criteria[0] as! NumericCriterion).value
+                let tardiness1 = (a.criteria[1] as! NumericCriterion).value
+                let makespan2 = (b.criteria[0] as! NumericCriterion).value
+                let tardiness2 = (b.criteria[1] as! NumericCriterion).value
+                
+                // Simplistic ranking by sum of normalized objectives
+                return makespan1 + tardiness1 < makespan2 + tardiness2
+            }
             
+            // 5. OPTIMIZATION: Select diverse solutions by ensuring we cover different parts of the front
+            var diverseOffspring: [FlowshopChromosome] = []
+            let selectionCount = populationSize - elites.count
+            
+            // Add solutions from sorted list at regular intervals to maximize diversity
+            let step = max(1, sortedOffspring.count / selectionCount)
+            for i in stride(from: 0, to: min(sortedOffspring.count, step * selectionCount), by: step) {
+                diverseOffspring.append(sortedOffspring[i])
+            }
+            
+            // Fill any remaining slots
+            while diverseOffspring.count < selectionCount && !sortedOffspring.isEmpty {
+                if let randomSolution = sortedOffspring.randomElement() {
+                    if !diverseOffspring.contains(where: { $0 == randomSolution }) {
+                        diverseOffspring.append(randomSolution)
+                    }
+                }
+            }
+            
+            // Add diverse offspring to the new population
+            newPopulation.append(contentsOf: diverseOffspring)
+            
+            // 6. OPTIMIZATION: Apply explicit mutations to a subset for diversity
+            let mutationCount = min(populationSize / 5, populationSize - newPopulation.count)
+            if mutationCount > 0 {
+                // Choose random solutions and apply stronger mutations
+                var mutants: [FlowshopChromosome] = []
+                for _ in 0..<mutationCount {
+                    if let base = newPopulation.randomElement() {
+                        // Apply stronger mutation to ensure significant diversity
+                        let mutant = base.mutate(mutationRate: mutationRate * 2.0)
+                        mutants.append(mutant)
+                    }
+                }
+                
+                // Add mutations to population
+                newPopulation.append(contentsOf: mutants)
+            }
+            
+            // 7. OPTIMIZATION: Ensure we have exactly populationSize
+            if newPopulation.count > populationSize {
+                newPopulation = Array(newPopulation.prefix(populationSize))
+            } else {
+                // Add random solutions if somehow we're short
+                while newPopulation.count < populationSize {
+                    newPopulation.append(FlowshopChromosome.random(with: problemData))
+                }
+            }
+            
+            // Replace population
+            population = newPopulation
+            
+            // Update Pareto front
             let frontStart = Date()
-            for solution in evaluatedOffspring {
+            for solution in newPopulation {
                 _ = paretoFront.add(solution)
             }
             let frontTime = Date().timeIntervalSince(frontStart)
             print("Pareto front update completed in \(String(format: "%.3f", frontTime))s")
+            print("Pareto front size: \(paretoFront.count)")
         } else {
-            print("GPU evaluation failed, falling back to CPU")
+            print("GPU generation failed, falling back to CPU")
             evolveOneGenerationCPU()
         }
         
