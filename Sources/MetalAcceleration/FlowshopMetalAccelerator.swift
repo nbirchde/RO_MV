@@ -28,17 +28,40 @@ public class FlowshopMetalAccelerator {
     
     // Initialize Metal setup
     private init() {
+        print("Initializing Metal Accelerator...")
+        
         // Try to get default Metal device
         if let device = MTLCreateSystemDefaultDevice() {
             self.device = device
+            print("✅ Found Metal device: \(device.name)")
             
             // Create command queue
             self.commandQueue = device.makeCommandQueue()
             self.isMetalAvailable = (self.commandQueue != nil)
             
+            if self.isMetalAvailable {
+                print("✅ Created Metal command queue")
+            } else {
+                print("❌ Failed to create Metal command queue")
+            }
+            
             // Initialize compute pipelines
+            print("Setting up Metal compute pipelines...")
             setupComputePipelines()
+            
+            if self.evaluationPipelineState != nil {
+                print("✅ Created evaluation pipeline")
+            } else {
+                print("❌ Failed to create evaluation pipeline")
+            }
+            
+            if self.generateAndEvaluatePipelineState != nil {
+                print("✅ Created generation pipeline")
+            } else {
+                print("❌ Failed to create generation pipeline")
+            }
         } else {
+            print("❌ No Metal device available")
             self.device = nil
             self.commandQueue = nil
             self.isMetalAvailable = false
@@ -323,23 +346,6 @@ public class FlowshopMetalAccelerator {
         return processingTimesBuffer != nil && prioritiesBuffer != nil && deadlinesBuffer != nil
     }
     
-    /// Calculate optimal thread and batch configuration for GPU
-    private func calculateOptimalBatchConfig(numSolutions: Int) -> (batchSize: Int, threadsPerGroup: Int, numBatches: Int) {
-        // Get the SIMD width for optimal GPU utilization (typically 32 on Apple GPUs)
-        let simdWidth = max(32, evaluationPipelineState?.threadExecutionWidth ?? 32)
-        
-        // Calculate threads per group as multiple of SIMD width, max 256 threads
-        let threadsPerGroup = min(256, simdWidth * 4)
-        
-        // Calculate batch size as multiple of threads per group
-        let batchSize = ((numSolutions + threadsPerGroup - 1) / threadsPerGroup) * threadsPerGroup
-        
-        // Calculate number of batches needed
-        let numBatches = (numSolutions + batchSize - 1) / batchSize
-        
-        return (batchSize, threadsPerGroup, numBatches)
-    }
-
     /// Evaluate multiple flowshop solutions in parallel on GPU
     public func evaluateSolutions(
         jobSequences: [[UInt32]]
@@ -355,97 +361,100 @@ public class FlowshopMetalAccelerator {
         }
         
         // Ensure we have solutions to evaluate
-        let numSolutions = jobSequences.count
-        guard numSolutions > 0 else {
+        guard !jobSequences.isEmpty else {
             return []
         }
         
-        // Calculate optimal batch configuration
-        let (batchSize, threadsPerGroup, numBatches) = calculateOptimalBatchConfig(numSolutions: numSolutions)
-        print("GPU config: \(numBatches) batches of \(batchSize) solutions, \(threadsPerGroup) threads per group")
+        // Ensure all solutions have the correct length
+        for sequence in jobSequences {
+            guard sequence.count == numJobs else {
+                print("Invalid job sequence length: \(sequence.count), expected \(numJobs)")
+                return nil
+            }
+        }
         
-        // Create result array
+        let numSolutions = jobSequences.count
+        
+        // Flatten job sequences for the GPU buffer
+        var flatJobSequences = [UInt32]()
+        flatJobSequences.reserveCapacity(numSolutions * Int(numJobs))
+        
+        for sequence in jobSequences {
+            flatJobSequences.append(contentsOf: sequence)
+        }
+        
+        // Create GPU buffers
+        let sequencesBufferSize = MemoryLayout<UInt32>.size * flatJobSequences.count
+        let objectivesBufferSize = MemoryLayout<SIMD2<Float>>.size * numSolutions
+        
+        guard let sequencesBuffer = device.makeBuffer(
+            bytes: flatJobSequences,
+            length: sequencesBufferSize,
+            options: .storageModeShared
+        ),
+        let objectivesBuffer = device.makeBuffer(
+            length: objectivesBufferSize,
+            options: .storageModeShared
+        ) else {
+            print("Failed to create Metal buffers")
+            return nil
+        }
+        
+        // Number of solutions as UInt32 for the kernel
+        var numSolutionsUInt32 = UInt32(numSolutions)
+        
+        // Create a command buffer
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            print("Failed to create command buffer or encoder")
+            return nil
+        }
+        
+        // Configure the compute encoder
+        computeEncoder.setComputePipelineState(evaluationPipelineState)
+        computeEncoder.setBuffer(sequencesBuffer, offset: 0, index: 0)
+        computeEncoder.setBuffer(processingTimesBuffer, offset: 0, index: 1)
+        computeEncoder.setBuffer(prioritiesBuffer, offset: 0, index: 2)
+        computeEncoder.setBuffer(deadlinesBuffer, offset: 0, index: 3)
+        computeEncoder.setBuffer(objectivesBuffer, offset: 0, index: 4)
+        computeEncoder.setBytes(&numJobs, length: MemoryLayout<UInt32>.size, index: 5)
+        computeEncoder.setBytes(&numMachines, length: MemoryLayout<UInt32>.size, index: 6)
+        computeEncoder.setBytes(&numSolutionsUInt32, length: MemoryLayout<UInt32>.size, index: 7)
+        
+        // Calculate grid and threadgroup sizes
+        let threadExecutionWidth = evaluationPipelineState.threadExecutionWidth
+        let maxThreadsPerThreadgroup = min(
+            evaluationPipelineState.maxTotalThreadsPerThreadgroup,
+            threadExecutionWidth * 2
+        )
+        
+        let threadsPerThreadgroup = MTLSize(
+            width: maxThreadsPerThreadgroup,
+            height: 1,
+            depth: 1
+        )
+        
+        let threadgroupsPerGrid = MTLSize(
+            width: (numSolutions + maxThreadsPerThreadgroup - 1) / maxThreadsPerThreadgroup,
+            height: 1,
+            depth: 1
+        )
+        
+        // Dispatch the compute kernel
+        computeEncoder.dispatchThreadgroups(threadgroupsPerGrid, threadsPerThreadgroup: threadsPerThreadgroup)
+        computeEncoder.endEncoding()
+        
+        // Execute and wait for completion
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        
+        // Read back results from GPU
         var results = [(makespan: Float, tardiness: Float)]()
-        results.reserveCapacity(numSolutions)
+        let objectivesPtr = objectivesBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: numSolutions)
         
-        // Process solutions in batches
-        for batchIndex in 0..<numBatches {
-            let batchStart = batchIndex * batchSize
-            let batchEnd = min(batchStart + batchSize, numSolutions)
-            let currentBatchSize = batchEnd - batchStart
-            
-            // Prepare batch data
-            var flatJobSequences = [UInt32]()
-            flatJobSequences.reserveCapacity(batchSize * Int(numJobs))
-            
-            // Fill batch with actual solutions
-            for i in batchStart..<batchEnd {
-                flatJobSequences.append(contentsOf: jobSequences[i])
-            }
-            
-            // Pad the batch if needed
-            while flatJobSequences.count < batchSize * Int(numJobs) {
-                flatJobSequences.append(contentsOf: jobSequences[0])  // Pad with first sequence
-            }
-            
-            // Create GPU buffers for this batch
-            guard let sequencesBuffer = device.makeBuffer(
-                bytes: flatJobSequences,
-                length: MemoryLayout<UInt32>.size * flatJobSequences.count,
-                options: .storageModeShared
-            ),
-            let objectivesBuffer = device.makeBuffer(
-                length: MemoryLayout<SIMD2<Float>>.size * batchSize,
-                options: .storageModeShared
-            ) else {
-                print("Failed to create Metal buffers for batch \(batchIndex)")
-                return nil
-            }
-            
-            // Create command buffer and encoder
-            guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
-                print("Failed to create command buffer or encoder")
-                return nil
-            }
-            
-            // Configure compute encoder
-            computeEncoder.setComputePipelineState(evaluationPipelineState)
-            computeEncoder.setBuffer(sequencesBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(processingTimesBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(prioritiesBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(deadlinesBuffer, offset: 0, index: 3)
-            computeEncoder.setBuffer(objectivesBuffer, offset: 0, index: 4)
-            computeEncoder.setBytes(&numJobs, length: MemoryLayout<UInt32>.size, index: 5)
-            computeEncoder.setBytes(&numMachines, length: MemoryLayout<UInt32>.size, index: 6)
-            
-            var batchSizeUInt32 = UInt32(batchSize)
-            computeEncoder.setBytes(&batchSizeUInt32, length: MemoryLayout<UInt32>.size, index: 7)
-            
-            // Configure thread sizes
-            let threadsPerThreadgroup = MTLSize(width: threadsPerGroup, height: 1, depth: 1)
-            let numThreadgroups = MTLSize(
-                width: (batchSize + threadsPerGroup - 1) / threadsPerGroup,
-                height: 1,
-                depth: 1
-            )
-            
-            // Dispatch compute kernel
-            computeEncoder.dispatchThreadgroups(numThreadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
-            computeEncoder.endEncoding()
-            
-            // Execute batch
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            
-            // Read results
-            let objectivesPtr = objectivesBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: batchSize)
-            
-            // Only append actual results (not padding)
-            for i in 0..<currentBatchSize {
-                let objective = objectivesPtr[i]
-                results.append((makespan: objective.x, tardiness: objective.y))
-            }
+        for i in 0..<numSolutions {
+            let objective = objectivesPtr[i]
+            results.append((makespan: objective.x, tardiness: objective.y))
         }
         
         return results

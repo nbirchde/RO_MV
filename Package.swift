@@ -31,8 +31,7 @@ let package = Package(
             name: "MetalAcceleration",
             dependencies: ["OptimizationCore"],
             resources: [
-                // Fix the Metal shader resource path
-                .process("Resources")
+                .process("Resources/FlowshopMetal.metal")
             ]
         )
     ]

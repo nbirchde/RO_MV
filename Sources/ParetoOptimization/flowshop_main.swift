@@ -37,11 +37,11 @@ public func solveFlowshopProblem() {
     print("\nInitializing GPU-accelerated genetic algorithm...")
     
     // Configuration parameters - tuned for better performance
-    let populationSize = 1000
+    let populationSize = 2000
     let generations = 100
-    let mutationRate = 0.15
+    let mutationRate = 0.2
     let crossoverRate = 0.8
-    let elitismCount = 50
+    let elitismCount = 100
     
     // Create the GA instance
     let ga = FlowshopGPUGeneticAlgorithm(
